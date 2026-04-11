@@ -1,7 +1,16 @@
+use std::borrow::Cow;
+use std::sync::OnceLock;
+
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use htmd_lib::convert as htmd_convert;
 use htmd_lib::HtmlToMarkdown;
+
+use lol_html::html_content::Element as LolElement;
+use lol_html::{rewrite_str, ElementContentHandlers, RewriteStrSettings, Selector};
+
+use regex::Regex;
 
 // Import the Python option classes we defined
 mod options;
@@ -42,11 +51,88 @@ fn create_options_with_skip_tags(tags: Vec<String>) -> PyResult<PyOptions> {
     Ok(options)
 }
 
+/// Preprocess HTML by dropping every element matched by a CSS selector.
+///
+/// Drives lol_html's streaming rewriter with a handler that removes each
+/// matching element and its entire subtree. The expected use is to strip
+/// noise (navboxes, reference lists, edit links, etc.) before handing the
+/// cleaned HTML off to `convert_html`.
+///
+/// `drop_selectors` is a list of CSS selectors in lol_html's supported
+/// subset (tag names, classes, IDs, attribute selectors including
+/// `[class*="foo"]`, descendant combinators). Invalid selectors raise
+/// `ValueError` before any rewriting work begins.
+#[pyfunction]
+fn preprocess_selectors(html: &str, drop_selectors: Vec<String>) -> PyResult<String> {
+    // Pre-parse every selector so we fail fast with a clean PyValueError
+    // rather than panicking inside lol_html's handler setup.
+    let parsed: Vec<Selector> = drop_selectors
+        .iter()
+        .map(|sel| {
+            sel.parse::<Selector>().map_err(|e| {
+                PyValueError::new_err(format!("invalid CSS selector '{sel}': {e}"))
+            })
+        })
+        .collect::<PyResult<_>>()?;
+
+    let element_handlers: Vec<_> = parsed
+        .into_iter()
+        .map(|sel| {
+            (
+                Cow::Owned(sel),
+                ElementContentHandlers::default().element(|el: &mut LolElement| {
+                    el.remove();
+                    Ok(())
+                }),
+            )
+        })
+        .collect();
+
+    let settings = RewriteStrSettings {
+        element_content_handlers: element_handlers,
+        ..RewriteStrSettings::new()
+    };
+
+    rewrite_str(html, settings).map_err(|e| {
+        PyRuntimeError::new_err(format!("lol_html rewrite failed: {e}"))
+    })
+}
+
+/// Rewrite citation-link markdown patterns to footnote-marker syntax.
+///
+/// Specifically matches `[<bracket>N<bracket>](#cite_note-...)` where
+/// `<bracket>` is either the backslash-escaped bracket htmd produces
+/// (`\[`, `\]`) or the numeric HTML entities some other converters emit
+/// (`&#91;`, `&#93;`), and rewrites those matches to `[^N]` footnote
+/// markers.
+///
+/// Useful after converting MediaWiki-style content: htmd renders
+/// `<sup class="reference"><a href="#cite_note-foo">[1]</a></sup>` as
+/// `[\[1\]](#cite_note-foo)` by default, which downstream markdown parsers
+/// don't treat as footnote references. This function normalises them.
+#[pyfunction]
+fn postprocess_footnote_markers(md: &str) -> String {
+    footnote_regex().replace_all(md, "[^$1]").into_owned()
+}
+
+fn footnote_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // The inner bracket group alternates htmd's `\[` / `\]` and the
+        // HTML numeric entities `&#91;` / `&#93;`. The link target pattern
+        // accepts any fragment starting with `#cite_note-`.
+        Regex::new(r"\[(?:\\\[|&#91;)(\d+)(?:\\\]|&#93;)\]\(#cite_note-[^)]*\)")
+            .expect("footnote regex compile")
+    })
+}
+
 #[pymodule]
 fn htmd(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Expose the functions
     m.add_function(wrap_pyfunction!(convert_html, m)?)?;
     m.add_function(wrap_pyfunction!(create_options_with_skip_tags, m)?)?;
+    m.add_function(wrap_pyfunction!(preprocess_selectors, m)?)?;
+    m.add_function(wrap_pyfunction!(postprocess_footnote_markers, m)?)?;
 
     // Expose the classes
     m.add_class::<PyOptions>()?;
@@ -114,6 +200,8 @@ fn htmd(m: &Bound<'_, PyModule>) -> PyResult<()> {
         vec![
             "convert_html",
             "create_options_with_skip_tags",
+            "preprocess_selectors",
+            "postprocess_footnote_markers",
             "Options",
             "HeadingStyle",
             "HrStyle",
