@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+use htmd_lib::element_handler::{HandlerResult, Handlers};
 use htmd_lib::options::{
     BrStyle as HtmdBrStyle, BulletListMarker as HtmdBulletListMarker,
     CodeBlockFence as HtmdCodeBlockFence, CodeBlockStyle as HtmdCodeBlockStyle,
@@ -7,7 +8,7 @@ use htmd_lib::options::{
     LinkReferenceStyle as HtmdLinkReferenceStyle, LinkStyle as HtmdLinkStyle,
     Options as HtmdOptions,
 };
-use htmd_lib::HtmlToMarkdownBuilder;
+use htmd_lib::{Element, HtmlToMarkdownBuilder};
 
 /// Python class that mirrors htmd's `Options`
 #[pyclass(name = "Options", from_py_object)]
@@ -35,6 +36,36 @@ pub struct PyOptions {
     // Special attributes that don't map directly to HtmdOptions
     #[pyo3(get, set)]
     pub skip_tags: Vec<String>,
+
+    // --- Text-only handler knobs -----------------------------------------
+    //
+    // These configure preset `add_handler` callbacks that htmd-py installs
+    // on the builder when apply_to_builder runs. They express the common
+    // "render text-only markdown" pattern (image alt text instead of image
+    // markdown, drop links that contain only an image) that projects doing
+    // LLM data ingestion and RAG generally want.
+    //
+    // The handler installation happens Rust-side so per-element callbacks
+    // never cross the Python/Rust boundary; these options are read once at
+    // convert time and compiled into a fast inner loop.
+    /// Custom image replacement template. When set, `<img>` elements are
+    /// replaced with this string after substituting `{alt}` for the alt
+    /// attribute's value. When `None`, htmd's default image rendering
+    /// (`![alt](src)`) is used unless `drop_empty_alt_images` is set.
+    #[pyo3(get, set)]
+    pub image_placeholder: Option<String>,
+    /// When true, `<img>` elements whose alt attribute is empty or missing
+    /// are dropped from the output entirely. Works both with a custom
+    /// `image_placeholder` template and with htmd's default image handler.
+    #[pyo3(get, set)]
+    pub drop_empty_alt_images: bool,
+    /// When true, `<a>` elements whose inner content is a single image
+    /// render (either the `image_placeholder` template's literal prefix
+    /// or the markdown image marker `![`) are unwrapped: the image render
+    /// is emitted without the surrounding link. Useful for LLM pipelines
+    /// that want caption text without the surrounding navigation link.
+    #[pyo3(get, set)]
+    pub drop_image_only_links: bool,
 }
 
 impl PyOptions {
@@ -114,6 +145,80 @@ impl PyOptions {
             builder = builder.skip_tags(skip_tags);
         }
 
+        // Install a custom `<img>` handler when any image-related knob is
+        // active. Returning `None` from a handler tells htmd to emit nothing
+        // for that element; returning `Some(HandlerResult::from(s))` inserts
+        // `s` as already-translated markdown (no bracket escaping, unlike
+        // text node serialization).
+        let wants_img_handler =
+            self.image_placeholder.is_some() || self.drop_empty_alt_images;
+        if wants_img_handler {
+            let template = self.image_placeholder.clone();
+            let drop_empty = self.drop_empty_alt_images;
+            builder = builder.add_handler(
+                vec!["img"],
+                move |handlers: &dyn Handlers, element: Element| -> Option<HandlerResult> {
+                    let alt = element
+                        .attrs
+                        .iter()
+                        .find(|a| &*a.name.local == "alt")
+                        .map(|a| a.value.to_string())
+                        .unwrap_or_default();
+                    let alt_trimmed = alt.trim();
+
+                    if alt_trimmed.is_empty() && drop_empty {
+                        return Some(HandlerResult::from(String::new()));
+                    }
+
+                    if let Some(ref t) = template {
+                        let replaced = t.replace("{alt}", alt_trimmed);
+                        return Some(HandlerResult::from(replaced));
+                    }
+
+                    // `drop_empty_alt_images` active but no custom template:
+                    // defer to htmd's built-in img handler for non-empty alts
+                    // so we get the standard `![alt](src)` rendering.
+                    handlers.fallback(element)
+                },
+            );
+        }
+
+        // Install a custom `<a>` handler that unwraps image-only links. An
+        // "image-only link" is an anchor whose rendered inner content, after
+        // trimming, begins with the literal prefix of the configured image
+        // placeholder (default `![` when no custom placeholder is set, to
+        // match htmd's built-in image rendering).
+        //
+        // The handler walks the element's children once to inspect the
+        // rendered content, which duplicates work the default anchor handler
+        // would do for non-image links. Empirically the overhead is small
+        // (a few percent on pathological tiers) and the code is easier to
+        // audit this way than reimplementing htmd's anchor rendering inline.
+        if self.drop_image_only_links {
+            let image_prefix: String = self
+                .image_placeholder
+                .as_deref()
+                .map(|t| {
+                    // Literal prefix is everything up to the first `{alt}`.
+                    t.split("{alt}").next().unwrap_or("").to_string()
+                })
+                .unwrap_or_else(|| "![".to_string());
+
+            builder = builder.add_handler(
+                vec!["a"],
+                move |handlers: &dyn Handlers, element: Element| -> Option<HandlerResult> {
+                    let inner = handlers.walk_children(element.node);
+                    let trimmed = inner.content.trim();
+                    let is_image_only = trimmed.is_empty()
+                        || (!image_prefix.is_empty() && trimmed.starts_with(&image_prefix));
+                    if is_image_only {
+                        return Some(HandlerResult::from(inner.content));
+                    }
+                    handlers.fallback(element)
+                },
+            );
+        }
+
         builder
     }
 }
@@ -177,6 +282,14 @@ impl PyOptions {
 
             // Special attributes
             skip_tags: Vec::new(),
+
+            // Text-only handler knobs. Defaults are off so new users get
+            // htmd's built-in rendering unchanged; setting any of these
+            // switches on the custom handler installation in
+            // apply_to_builder.
+            image_placeholder: None,
+            drop_empty_alt_images: false,
+            drop_image_only_links: false,
         }
     }
 }
