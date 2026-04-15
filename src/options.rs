@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use pyo3::prelude::*;
 
 use htmd_lib::element_handler::{HandlerResult, Handlers};
@@ -9,6 +11,60 @@ use htmd_lib::options::{
     Options as HtmdOptions,
 };
 use htmd_lib::{Element, HtmlToMarkdownBuilder};
+use markup5ever_rcdom::{Node, NodeData};
+
+/// Detect whether an `<a>` element's direct children consist of exactly one
+/// `<img>` element plus optional whitespace-only text nodes, and nothing
+/// else. This is the structural definition of an "image-only link",
+/// independent of how any child handler renders its output.
+///
+/// An earlier version of `drop_image_only_links` detected image-only links
+/// by calling `handlers.walk_children()` and checking whether the rendered
+/// markdown started with the image placeholder's literal prefix. That
+/// heuristic false-positives on any link whose first child is an image
+/// followed by sibling text content:
+///
+/// ```text
+/// <a href="..."><img alt="foo"> Read more</a>
+/// ```
+///
+/// renders (with `image_placeholder = "[Image: {alt}]"`) to
+/// `[Image: foo] Read more`, which starts with `[Image: ` and would be
+/// unwrapped — silently losing both the "Read more" text and the link
+/// href. The same heuristic also made the handler's correctness depend on
+/// whether alt text containing brackets was escaped by the image
+/// rendering step, which is out of this handler's control.
+///
+/// DOM-based detection is immune to both problems: it never looks at
+/// rendered text. Whitespace-only text node siblings (the natural result
+/// of HTML pretty-printing like `<a>\n  <img ...>\n</a>`) don't disqualify,
+/// but any non-whitespace text, any non-`<img>` element, or a second
+/// `<img>` sibling does. Comments, doctype, and processing instructions
+/// produce no visible output and are ignored.
+fn is_image_only_anchor(node: &Rc<Node>) -> bool {
+    let children = node.children.borrow();
+    let mut saw_image = false;
+    for child in children.iter() {
+        match &child.data {
+            NodeData::Text { contents } => {
+                if !contents.borrow().chars().all(char::is_whitespace) {
+                    return false;
+                }
+            }
+            NodeData::Element { name, .. } => {
+                if &*name.local != "img" {
+                    return false;
+                }
+                if saw_image {
+                    return false;
+                }
+                saw_image = true;
+            }
+            _ => {}
+        }
+    }
+    saw_image
+}
 
 /// Python class that mirrors htmd's `Options`
 #[pyclass(name = "Options", from_py_object)]
@@ -59,11 +115,13 @@ pub struct PyOptions {
     /// `image_placeholder` template and with htmd's default image handler.
     #[pyo3(get, set)]
     pub drop_empty_alt_images: bool,
-    /// When true, `<a>` elements whose inner content is a single image
-    /// render (either the `image_placeholder` template's literal prefix
-    /// or the markdown image marker `![`) are unwrapped: the image render
-    /// is emitted without the surrounding link. Useful for LLM pipelines
-    /// that want caption text without the surrounding navigation link.
+    /// When true, `<a>` elements whose direct DOM children consist of
+    /// exactly one `<img>` element (with any surrounding whitespace-only
+    /// text nodes) are unwrapped: the image is emitted without the
+    /// surrounding link. Links containing an image plus additional text
+    /// or element siblings are left intact. Useful for LLM pipelines that
+    /// want caption text without navigation-link chrome wrapped around
+    /// each image. See `is_image_only_anchor` for the precise rule.
     #[pyo3(get, set)]
     pub drop_image_only_links: bool,
 }
@@ -183,35 +241,24 @@ impl PyOptions {
             );
         }
 
-        // Install a custom `<a>` handler that unwraps image-only links. An
-        // "image-only link" is an anchor whose rendered inner content, after
-        // trimming, begins with the literal prefix of the configured image
-        // placeholder (default `![` when no custom placeholder is set, to
-        // match htmd's built-in image rendering).
-        //
-        // The handler walks the element's children once to inspect the
-        // rendered content, which duplicates work the default anchor handler
-        // would do for non-image links. Empirically the overhead is small
-        // (a few percent on pathological tiers) and the code is easier to
-        // audit this way than reimplementing htmd's anchor rendering inline.
+        // Install a custom `<a>` handler that unwraps image-only links.
+        // Detection is DOM-structural (see `is_image_only_anchor`): the
+        // anchor's direct children must be exactly one `<img>` plus any
+        // whitespace-only text siblings, and nothing else. This avoids the
+        // false-positive class that string-matching the rendered markdown
+        // would expose — specifically, links containing an image followed
+        // by trailing text would otherwise be unwrapped and lose both the
+        // text and the href.
         if self.drop_image_only_links {
-            let image_prefix: String = self
-                .image_placeholder
-                .as_deref()
-                .map(|t| {
-                    // Literal prefix is everything up to the first `{alt}`.
-                    t.split("{alt}").next().unwrap_or("").to_string()
-                })
-                .unwrap_or_else(|| "![".to_string());
-
             builder = builder.add_handler(
                 vec!["a"],
                 move |handlers: &dyn Handlers, element: Element| -> Option<HandlerResult> {
-                    let inner = handlers.walk_children(element.node);
-                    let trimmed = inner.content.trim();
-                    let is_image_only = trimmed.is_empty()
-                        || (!image_prefix.is_empty() && trimmed.starts_with(&image_prefix));
-                    if is_image_only {
+                    if is_image_only_anchor(element.node) {
+                        // The img handler registered above has already
+                        // produced the replacement content (honoring
+                        // `image_placeholder` / `drop_empty_alt_images`
+                        // if set); we emit it verbatim with no wrapper.
+                        let inner = handlers.walk_children(element.node);
                         return Some(HandlerResult::from(inner.content));
                     }
                     handlers.fallback(element)

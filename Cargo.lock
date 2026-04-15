@@ -155,6 +155,7 @@ version = "0.1.0"
 dependencies = [
  "htmd",
  "lol_html",
+ "markup5ever_rcdom",
  "pyo3",
  "regex",
 ]

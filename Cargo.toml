@@ -1,6 +1,11 @@
 [dependencies]
 htmd_lib = { package = "htmd", version = "0.5" }
 lol_html = "2"
+# `markup5ever_rcdom` is already a transitive dep via htmd. Pinning it as a
+# direct dep lets the `drop_image_only_links` handler walk `<a>` children via
+# the public `NodeData` API so it can make a DOM-structural decision instead
+# of pattern-matching rendered markdown. Version tracks htmd's own pin.
+markup5ever_rcdom = "0.38"
 pyo3 = "0.28"
 regex = "1"
 
