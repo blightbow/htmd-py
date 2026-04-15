@@ -66,6 +66,41 @@ fn is_image_only_anchor(node: &Rc<Node>) -> bool {
     saw_image
 }
 
+/// Escape the CommonMark characters in alt text that can break a
+/// `[placeholder]`-shaped template when substituted: backslash (the
+/// escape character itself), `[` (opens link/image syntax), and `]`
+/// (closes it).
+///
+/// Over-escaping is the safer failure mode. Templates that don't need
+/// bracket protection (e.g. `{alt}` alone) get backslash-escaped alt
+/// content where the alt contains brackets, which renders the same in
+/// CommonMark but is robust against stricter parsers, reference-
+/// definition collisions in containing documents, and early termination
+/// of outer bracket contexts (e.g. placing the placeholder output
+/// inside a link text where an unescaped `]` would terminate the outer
+/// bracket).
+///
+/// The escape set is intentionally minimal. `(`, `)`, `` ` ``, `*`, `_`
+/// etc. can have grammar effects in other contexts but cannot break a
+/// `[placeholder]`-shaped template on their own, and escaping them
+/// would produce uglier output for templates that don't need the
+/// protection. If a future template shape requires different escaping
+/// (e.g. a `(...)`-shaped template that needs paren escaping), the set
+/// should grow to match the template's context, not globally.
+fn escape_alt_for_template(alt: &str) -> String {
+    let mut out = String::with_capacity(alt.len());
+    for ch in alt.chars() {
+        match ch {
+            '\\' | '[' | ']' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Python class that mirrors htmd's `Options`
 #[pyclass(name = "Options", from_py_object)]
 #[derive(Clone)]
@@ -207,7 +242,10 @@ impl PyOptions {
         // active. Returning `None` from a handler tells htmd to emit nothing
         // for that element; returning `Some(HandlerResult::from(s))` inserts
         // `s` as already-translated markdown (no bracket escaping, unlike
-        // text node serialization).
+        // text node serialization). The template substitution path handles
+        // that by pre-escaping alt text via `escape_alt_for_template` before
+        // replacing `{alt}` in the user's template, so alt content containing
+        // `[`, `]`, or `\` can't break markdown grammar in the output.
         let wants_img_handler =
             self.image_placeholder.is_some() || self.drop_empty_alt_images;
         if wants_img_handler {
@@ -229,7 +267,8 @@ impl PyOptions {
                     }
 
                     if let Some(ref t) = template {
-                        let replaced = t.replace("{alt}", alt_trimmed);
+                        let escaped = escape_alt_for_template(alt_trimmed);
+                        let replaced = t.replace("{alt}", &escaped);
                         return Some(HandlerResult::from(replaced));
                     }
 
